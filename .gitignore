@@ -1,0 +1,15 @@
+# Secrets — real credentials, NEVER commit
+arduino_secrets.h
+
+# Claude Code local settings (machine-specific, may contain local IPs)
+.claude/settings.local.json
+
+# Build artifacts
+build/
+*.bin
+*.elf
+*.hex
+*.map
+
+# macOS
+.DS_Store
