@@ -99,3 +99,7 @@ R/<VRM_ID>/keepalive     (empty payload, every 30 s)
 ## Libraries
 
 [HomeSpan](https://github.com/HomeSpan/HomeSpan) · [PubSubClient](https://github.com/knolleary/pubsubclient) · [ArduinoJson](https://arduinojson.org/)
+
+## License
+
+[MIT](LICENSE) © 2026 Alex Melnyk
