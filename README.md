@@ -94,7 +94,37 @@ R/<VRM_ID>/keepalive     (empty payload, every 30 s)
 - **Uncertified warning:** the Home app shows "not certified" for any DIY HomeKit device (no Apple MFi
   credential). It's cosmetic — everything works.
 - **Matter:** the ESP32-S3 *can* run Matter over Wi-Fi, but Apple Home doesn't display Matter power/energy
-  data anyway, so it wouldn't help show watts. Classic HomeKit (this project) is the right call for Apple Home.
+  data (as of mid-2026), so it wouldn't help show watts today. See **[Roadmap: a possible Matter v2](#roadmap-a-possible-matter-v2)**.
+
+## Roadmap: a possible Matter v2
+
+*Why this uses classic HomeKit today, and what would justify a Matter rewrite later.*
+**Assessment current as of July 2026 — revisit when iOS 27 ships.**
+
+HomeKit (HAP) has **no volts/watts/energy characteristic**, so in Apple's Home app the electrical
+readings ride on a borrowed type (`lux`); real `V`/`W` are only available via the Eve-style custom
+characteristics this sketch adds, viewed in Eve / Controller for HomeKit / Home+.
+
+**Matter** *does* define proper energy device types (Matter 1.4: Electrical Power/Energy Measurement,
+Battery Storage, Solar Power; inverters are on the CSA roadmap). But as of mid-2026, **Apple Home
+still does not display Matter energy data**, and Apple's [EnergyKit](https://developer.apple.com/energykit/)
+(iOS 26) only pushes grid/rate/clean-energy forecasts *out* to EV-charger and thermostat apps (US-only) —
+it does **not** ingest device power *into* Home. Energy monitoring in the Home app is *reported* to be
+coming in **iOS 27** (fall 2026), but that's unshipped as of this writing.
+
+A Matter rewrite only makes sense once **all three** are true:
+
+1. **Apple Home actually renders Matter energy device types** — verify iOS 27 displays
+   Battery-Storage / Solar / Inverter device types, not just EV/thermostat scheduling.
+2. **ESP32 tooling exposes the energy clusters** — Electrical Power Measurement (`0x0090`) and
+   Electrical Energy Measurement (`0x0091`) are not yet wrapped by the Arduino Matter library
+   (open feature request); otherwise it needs raw ESP-Matter (ESP-IDF) C++.
+3. **You accept rewriting off HomeSpan** — a device is *either* a HAP accessory *or* a Matter one,
+   not both. Matter-over-Wi-Fi works on this ESP32-S3 (no Thread radio).
+
+Until then, this HomeSpan build is the right call for Apple Home. Note: **Home Assistant / SmartThings
+already display Matter energy today**, so a Matter v2 would benefit those platforms immediately,
+independent of Apple.
 
 ## Libraries
 
