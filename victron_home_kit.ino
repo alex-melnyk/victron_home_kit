@@ -70,6 +70,10 @@ const char* HOMEKIT_CODE  = SECRET_HOMEKIT_CODE;
 // MultiPlus serial number (cosmetic — shown in the Home app accessory details)
 const char* DEVICE_SERIAL = SECRET_DEVICE_SERIAL;
 
+// Health states for the status LED / heartbeat. Declared before the first
+// function definition so Arduino's auto-generated prototypes can see the type.
+enum HealthStatus { ST_BOOTING, ST_WIFI_DOWN, ST_MQTT_DOWN, ST_STALE, ST_HEALTHY };
+
 // ============================================================
 //  MQTT topic builder
 // ============================================================
@@ -92,12 +96,17 @@ float g_battPower = 0.0;   // Battery DC power in W (negative = charging)
 float g_acOutP    = 0.0;   // Inverter AC output power in W (>= 0)
 float g_gridP     = 0.0;   // Grid (active AC input) power in W
 
+unsigned long lastDataMs = 0;  // millis() of the last valid MQTT reading (0 = none yet)
+
 // ============================================================
 //  Forward declarations
 // ============================================================
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 void mqttReconnect();
 void mqttKeepAlive();
+void wifiEnsureConnected();
+void updateStatusLed();
+void logHeartbeat();
 
 WiFiClient   wifiClient;
 PubSubClient mqtt(wifiClient);
@@ -107,6 +116,28 @@ const unsigned long KEEPALIVE_MS = 30000; // Victron drops silent clients after 
 
 unsigned long lastReconnectAttempt = 0;
 const unsigned long RECONNECT_MS = 5000;  // retry MQTT every 5s without blocking HomeKit
+
+unsigned long lastWifiCheck = 0;
+const unsigned long WIFI_CHECK_MS = 10000; // re-check the WiFi link every 10s (non-blocking)
+
+unsigned long lastHeartbeat = 0;
+const unsigned long HEARTBEAT_MS = 60000;  // dump a health snapshot to serial every 60s
+const unsigned long DATA_STALE_MS = 120000; // no MQTT reading in 2 min = data considered stale
+
+// ============================================================
+//  Status LED (Arduino Nano ESP32 onboard RGB — ACTIVE LOW)
+//  Writing LOW turns a channel ON. Colours signal health at a glance:
+//    green  solid  = healthy (WiFi + MQTT + fresh data)
+//    blue   solid  = booting / WiFi connecting
+//    red    blink  = WiFi link down
+//    yellow blink  = WiFi up but MQTT (Victron GX) down
+//    yellow solid  = connected but no fresh data (stale)
+// ============================================================
+static inline void ledWrite(bool r, bool g, bool b) {
+  digitalWrite(LED_RED,   r ? LOW : HIGH);   // active low
+  digitalWrite(LED_GREEN, g ? LOW : HIGH);
+  digitalWrite(LED_BLUE,  b ? LOW : HIGH);
+}
 
 // ============================================================
 //  HomeKit: Battery Service (hidden — provides low-battery alert)
@@ -213,6 +244,7 @@ void mqttCallback(char* topicStr, byte* payload, unsigned int length) {
   float val = doc["value"] | 0.0f;
   String t = String(topicStr);
 
+  lastDataMs = millis();   // a valid reading arrived → data is fresh
   Serial.printf("[MQTT] %s -> %.2f\n", topicStr, val);
 
   if (t.indexOf("Dc/Battery/Soc") >= 0) {
@@ -279,6 +311,73 @@ void mqttKeepAlive() {
 }
 
 // ============================================================
+//  WiFi watchdog — non-blocking reconnect
+//  If the link drops (router reboot, lease renewal, AP roam) the
+//  whole bridge becomes unreachable and HomeKit shows "No Response".
+//  Nudge the driver to reconnect without ever blocking homeSpan.poll().
+// ============================================================
+void wifiEnsureConnected() {
+  if (millis() - lastWifiCheck < WIFI_CHECK_MS) return;
+  lastWifiCheck = millis();
+
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  Serial.println("[WiFi] Link down — reconnecting...");
+  WiFi.disconnect();
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);   // returns immediately; driver reconnects in the background
+}
+
+// ============================================================
+//  Health assessment — one source of truth for LED + logs
+// ============================================================
+HealthStatus currentHealth() {
+  if (WiFi.status() != WL_CONNECTED) return ST_WIFI_DOWN;
+  if (!mqtt.connected())             return ST_MQTT_DOWN;
+  if (lastDataMs == 0 || millis() - lastDataMs > DATA_STALE_MS) return ST_STALE;
+  return ST_HEALTHY;
+}
+
+// ============================================================
+//  Status LED — drives the onboard RGB from current health.
+//  Non-blocking: blink phase derived from millis().
+// ============================================================
+void updateStatusLed() {
+  bool blinkFast = (millis() / 250) % 2;   // ~2 Hz
+  bool blinkSlow = (millis() / 600) % 2;   // ~0.8 Hz
+
+  switch (currentHealth()) {
+    case ST_WIFI_DOWN: ledWrite(blinkFast, 0, 0);                 break; // red blink
+    case ST_MQTT_DOWN: ledWrite(blinkSlow, blinkSlow, 0);         break; // yellow blink
+    case ST_STALE:     ledWrite(1, 1, 0);                         break; // yellow solid
+    case ST_HEALTHY:   ledWrite(0, 1, 0);                         break; // green solid
+    default:           ledWrite(0, 0, 1);                         break; // blue (booting)
+  }
+}
+
+// ============================================================
+//  Heartbeat log — periodic health snapshot for debugging.
+//  Grep the serial monitor for "[HB]" to see uptime / WiFi / heap.
+// ============================================================
+void logHeartbeat() {
+  if (millis() - lastHeartbeat < HEARTBEAT_MS) return;
+  lastHeartbeat = millis();
+
+  const char* names[] = {"BOOTING", "WIFI_DOWN", "MQTT_DOWN", "STALE", "HEALTHY"};
+  long dataAge = lastDataMs ? (long)((millis() - lastDataMs) / 1000) : -1;
+
+  Serial.printf(
+    "[HB] up=%lus status=%s wifi=%s rssi=%ddBm ip=%s mqtt=%d(rc=%d) dataAge=%lds heap=%u/%u\n",
+    millis() / 1000,
+    names[currentHealth()],
+    WiFi.status() == WL_CONNECTED ? "up" : "down",
+    (int)WiFi.RSSI(),
+    WiFi.localIP().toString().c_str(),
+    mqtt.connected() ? 1 : 0, mqtt.state(),
+    dataAge,
+    (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap());
+}
+
+// ============================================================
 //  SETUP
 // ============================================================
 void setup() {
@@ -286,7 +385,19 @@ void setup() {
   delay(500);
   Serial.println("\n\n=== Victron HomeKit Bridge ===");
 
+  // --- Status LED (onboard RGB, active low) — blue while we boot/connect ---
+  pinMode(LED_RED,   OUTPUT);
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_BLUE,  OUTPUT);
+  ledWrite(0, 0, 1);   // blue = booting
+
   // --- WiFi (connect first so MQTT is usable; HomeSpan reuses this link) ---
+  // Station mode + no modem sleep: with the default WIFI_PS_MIN_MODEM power-save
+  // the radio parks periodically and starts dropping mDNS/HAP keepalives, which
+  // makes HomeKit report "No Response" after the bridge has been up a while.
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("[WiFi] Connecting");
   while (WiFi.status() != WL_CONNECTED) {
@@ -347,6 +458,9 @@ void setup() {
 //  LOOP
 // ============================================================
 void loop() {
+  // WiFi: keep the link up first — everything else depends on it
+  wifiEnsureConnected();    // self-throttles; no-op while connected
+
   // MQTT: non-blocking reconnect + service the connection when up
   mqttReconnect();          // self-throttles; no-op if already connected
   if (mqtt.connected()) {
@@ -356,4 +470,8 @@ void loop() {
 
   // HomeSpan loop (handles HAP protocol, pairing, etc.) — always runs
   homeSpan.poll();
+
+  // Status indication + periodic debug snapshot (both non-blocking)
+  updateStatusLed();
+  logHeartbeat();
 }
